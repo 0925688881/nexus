@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -148,8 +147,8 @@ tr:hover{background:#172944}
     <input type="file" id="fileInput" accept=".json,application/json" onchange="importData(event)">
   </div>
   <div class="status-text">
-    資料來源：臺灣證券交易所公開 OpenAPI。免 Token、免註冊。
-    掃描範圍：上市股票。資料儲存在本機瀏覽器。
+    資料來源：臺灣證券交易所公開 OpenAPI，透過 NEXUS Cloudflare Worker 連線。
+    免 Token、免註冊。掃描範圍：上市股票。資料儲存在本機瀏覽器。
   </div>
 </div>
 
@@ -161,7 +160,7 @@ tr:hover{background:#172944}
       <input id="nearPct" type="number" value="3" min="0.1" max="30" step="0.5">
     </div>
     <div class="field">
-      <label>爆量倍數（相對20日均量）</label>
+      <label>爆量倍數（相對均量）</label>
       <input id="volumeRatio" type="number" value="1.5" min="1" max="10" step="0.1">
     </div>
     <div class="field">
@@ -181,7 +180,9 @@ tr:hover{background:#172944}
       </select>
     </div>
   </div>
-  <div class="status-text">篩選邏輯：收盤價接近近期最低價，並且成交量達到設定均量倍數。兩項條件必須同時成立。</div>
+  <div class="status-text">
+    篩選邏輯：收盤價接近近期最低價，並且當日成交量達到前 N 個交易日均量設定倍數。兩項條件必須同時成立。
+  </div>
   <div class="actions" style="margin-top:12px">
     <button class="green" onclick="runFilter()">重新套用篩選條件</button>
   </div>
@@ -230,21 +231,27 @@ tr:hover{background:#172944}
     </div>
   </div>
   <div class="notice">
-    注意：首次使用沒有過去 22 或 66 日的完整歷史資料。系統會從開始使用後逐日累積，不會把第一天資料冒充成歷史行情。請定期備份資料，並盡量在每個交易日收盤後掃描一次。
+    注意：首次使用沒有過去 22 或 66 日的完整歷史資料。系統會從開始使用後逐日累積，不會把第一天資料冒充成歷史行情。
+    20日均量需要至少21個交易日資料，22日低點需要至少22個交易日資料，66日低點需要至少66個交易日資料。
+    請定期備份資料，並盡量在每個交易日收盤後掃描一次。
   </div>
   <div class="actions" style="margin-top:12px">
     <button class="danger" onclick="clearHistory()">清除本機歷史資料</button>
   </div>
 </div>
 
-<div class="footer">NEXUS MARKET INTELLIGENCE © 2026<br>DATA SOURCE: TWSE OPENAPI · LOCAL DATABASE</div>
+<div class="footer">NEXUS MARKET INTELLIGENCE © 2026<br>DATA SOURCE: TWSE OPENAPI · CLOUDFLARE WORKER · LOCAL DATABASE</div>
 </div>
 
 <script>
 "use strict";
 
+/* =========================================
+   NEXUS Cloudflare Worker API
+========================================= */
+
 const API_URL =
-"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL";
+"https://nexus-stock-api.r0925688881.workers.dev/";
 
 const DB_KEY = "NEXUS_BEAR_VOLUME_HISTORY_V1";
 
@@ -254,13 +261,29 @@ let filteredRows = [];
 let currentTab = "signal";
 let isScanning = false;
 
+/* =========================================
+   本機資料庫
+========================================= */
+
 function loadDatabase(){
   try{
     const raw = localStorage.getItem(DB_KEY);
-    if(!raw) return {days:[],stocks:{}};
+
+    if(!raw){
+      return {days:[],stocks:{}};
+    }
+
     const data = JSON.parse(raw);
-    if(!data.days || !data.stocks) return {days:[],stocks:{}};
-    return data;
+
+    if(!Array.isArray(data.days) || !data.stocks){
+      return {days:[],stocks:{}};
+    }
+
+    return {
+      days:data.days,
+      stocks:data.stocks
+    };
+
   }catch(e){
     return {days:[],stocks:{}};
   }
@@ -270,51 +293,139 @@ function saveDatabase(){
   try{
     localStorage.setItem(DB_KEY,JSON.stringify(database));
     return true;
+
   }catch(e){
     alert("本機儲存空間不足，請先匯出備份或清理空間。");
     return false;
   }
 }
 
+/* =========================================
+   數字及日期處理
+========================================= */
+
 function numberValue(value){
   if(value===null || value===undefined) return NaN;
+
   const s=String(value).replace(/,/g,"").trim();
+
   if(!s || s==="--" || s==="-" || s==="X") return NaN;
+
   return Number(s);
 }
 
-function parseDate(value){
-  const s=String(value||"").replace(/\D/g,"");
-  if(s.length!==7) return "";
-  const year=Number(s.slice(0,3))+1911;
-  return year+"-"+s.slice(3,5)+"-"+s.slice(5,7);
+function normalizeDate(value){
+  if(!value) return "";
+
+  const s=String(value).trim();
+
+  // 西元日期：2026-11-01 或 2026/11/01
+  const western=s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+
+  if(western){
+    return western[1]+"-"+
+      String(western[2]).padStart(2,"0")+"-"+
+      String(western[3]).padStart(2,"0");
+  }
+
+  // 民國日期：115/11/01 或 1151101
+  const digits=s.replace(/\D/g,"");
+
+  if(digits.length===7){
+    const year=Number(digits.slice(0,3))+1911;
+    const month=digits.slice(3,5);
+    const day=digits.slice(5,7);
+
+    return year+"-"+month+"-"+day;
+  }
+
+  if(digits.length===8){
+    return digits.slice(0,4)+"-"+
+      digits.slice(4,6)+"-"+
+      digits.slice(6,8);
+  }
+
+  return "";
 }
 
 function dateNow(){
-  const d=new Date();
-  return d.getFullYear()+"-"+
-    String(d.getMonth()+1).padStart(2,"0")+"-"+
-    String(d.getDate()).padStart(2,"0");
+  const parts=new Intl.DateTimeFormat("en-CA",{
+    timeZone:"Asia/Taipei",
+    year:"numeric",
+    month:"2-digit",
+    day:"2-digit"
+  }).formatToParts(new Date());
+
+  const values={};
+
+  parts.forEach(p=>{
+    values[p.type]=p.value;
+  });
+
+  return values.year+"-"+values.month+"-"+values.day;
 }
+
+function getTradingDate(data){
+  // 優先使用 API 真正提供的日期欄位
+  for(const item of data){
+    const possibleDate=
+      item.Date ||
+      item.TradeDate ||
+      item.date ||
+      item.tradeDate;
+
+    const parsed=normalizeDate(possibleDate);
+
+    if(parsed) return {
+      date:parsed,
+      assumed:false
+    };
+  }
+
+  // STOCK_DAY_ALL 通常沒有日期欄位
+  // 因此使用台灣當地日期作為暫定日期
+  return {
+    date:dateNow(),
+    assumed:true
+  };
+}
+
+/* =========================================
+   狀態顯示
+========================================= */
 
 function setStatus(message,progress){
   document.getElementById("statusText").textContent=message;
+
   document.getElementById("progressBar").style.width=
     Math.max(0,Math.min(100,progress||0))+"%";
 }
 
+/* =========================================
+   全市場掃描
+========================================= */
+
 async function startScan(){
+
   if(isScanning) return;
+
   isScanning=true;
+
   const btn=document.getElementById("scanBtn");
+
   btn.disabled=true;
   btn.textContent="掃描中...";
-  setStatus("正在連線臺灣證券交易所公開行情資料...",10);
+
+  setStatus("正在連線 NEXUS Cloudflare 行情伺服器...",10);
 
   try{
+
     const response=await fetch(API_URL,{
       method:"GET",
-      cache:"no-store"
+      cache:"no-store",
+      headers:{
+        "Accept":"application/json"
+      }
     });
 
     if(!response.ok){
@@ -327,28 +438,39 @@ async function startScan(){
       throw new Error("行情資料格式不正確或沒有資料。");
     }
 
-    setStatus("正在整理股票名稱、代號及成交資料...",45);
+    setStatus("連線成功，正在整理全市場股票資料...",40);
 
     const rows=data.map(item=>{
+
       const code=String(item.Code||"").trim();
       const name=String(item.Name||"").trim();
+
       const close=numberValue(item.ClosingPrice);
       const low=numberValue(item.LowestPrice);
       const volume=numberValue(item.TradeVolume);
-      const date=parseDate(item.Date);
 
       return {
-        code,name,close,low,volume,date
+        code,
+        name,
+        close,
+        low,
+        volume
       };
+
     }).filter(x=>
       x.code &&
       x.name &&
       /^[0-9]+$/.test(x.code) &&
+
+      // 排除 ETF 等 00 開頭代號
       !x.code.startsWith("00") &&
+
       Number.isFinite(x.close) &&
       x.close>0 &&
+
       Number.isFinite(x.low) &&
       x.low>0 &&
+
       Number.isFinite(x.volume) &&
       x.volume>=0
     );
@@ -357,79 +479,140 @@ async function startScan(){
       throw new Error("沒有取得可用的股票行情。");
     }
 
-    const dates=[...new Set(rows.map(x=>x.date).filter(Boolean))];
-    if(dates.length===0) throw new Error("無法辨識行情日期。");
+    const dateInfo=getTradingDate(data);
+    const tradingDate=dateInfo.date;
 
-    const tradingDate=dates.sort().pop();
-
-    if(database.days.includes(tradingDate)){
-      setStatus("今天（"+tradingDate+"）的資料已經存在，不重複累積。",100);
-    }else{
-      setStatus("正在將 "+rows.length+" 檔股票寫入本機歷史資料庫...",75);
-
-      rows.forEach(stock=>{
-        if(!database.stocks[stock.code]){
-          database.stocks[stock.code]={
-            name:stock.name,
-            history:[]
-          };
-        }
-
-        const item=database.stocks[stock.code];
-        item.name=stock.name;
-
-        item.history.push({
-          date:tradingDate,
-          close:stock.close,
-          low:stock.low,
-          volume:stock.volume
-        });
-
-        item.history.sort((a,b)=>a.date.localeCompare(b.date));
-
-        // 保留最近120個交易日
-        if(item.history.length>120){
-          item.history=item.history.slice(-120);
-        }
-      });
-
-      database.days.push(tradingDate);
-      database.days=[...new Set(database.days)].sort().slice(-120);
-
-      if(!saveDatabase()){
-        throw new Error("本機資料儲存失敗。");
-      }
-
-      setStatus("行情取得成功！已儲存 "+rows.length+
-        " 檔股票，資料日期："+tradingDate,100);
+    if(!tradingDate){
+      throw new Error("無法辨識行情日期。");
     }
 
-    latestRows=rows.map(stock=>{
+    setStatus("正在更新 "+rows.length+" 檔股票的本機歷史資料...",65);
+
+    let newCount=0;
+    let updateCount=0;
+
+    rows.forEach(stock=>{
+
+      if(!database.stocks[stock.code]){
+        database.stocks[stock.code]={
+          name:stock.name,
+          history:[]
+        };
+      }
+
       const item=database.stocks[stock.code];
-      return calculateStock(stock.code,item);
-    }).filter(Boolean);
+
+      item.name=stock.name;
+
+      if(!Array.isArray(item.history)){
+        item.history=[];
+      }
+
+      // 同一日期不重複增加交易日
+      // 但允許更新當日行情，避免盤中多次掃描資料過時
+      const existingIndex=item.history.findIndex(
+        h=>h.date===tradingDate
+      );
+
+      const newRecord={
+        date:tradingDate,
+        close:stock.close,
+        low:stock.low,
+        volume:stock.volume
+      };
+
+      if(existingIndex>=0){
+        item.history[existingIndex]=newRecord;
+        updateCount++;
+      }else{
+        item.history.push(newRecord);
+        newCount++;
+      }
+
+      item.history.sort((a,b)=>
+        a.date.localeCompare(b.date)
+      );
+
+      // 保留最近120個交易日
+      if(item.history.length>120){
+        item.history=item.history.slice(-120);
+      }
+
+    });
+
+    // 更新全市場交易日期
+    database.days.push(tradingDate);
+
+    database.days=[
+      ...new Set(database.days)
+    ].sort().slice(-120);
+
+    if(!saveDatabase()){
+      throw new Error("本機資料儲存失敗。");
+    }
+
+    // 只顯示本次最新行情中存在的股票
+    latestRows=rows.map(stock=>
+      calculateStock(
+        stock.code,
+        database.stocks[stock.code]
+      )
+    ).filter(Boolean);
 
     document.getElementById("dataDate").textContent=tradingDate;
+
+    let message=
+      "行情取得成功！共 "+rows.length+
+      " 檔股票；新增 "+newCount+
+      " 筆、更新 "+updateCount+
+      " 筆。資料日期："+tradingDate;
+
+    if(dateInfo.assumed){
+      message+="。注意：API 未提供日期，使用台灣當地日期暫定標記，請於交易日收盤後掃描。";
+    }
+
+    setStatus(message,100);
+
     runFilter();
+
     updateStats(rows.length);
 
   }catch(error){
+
     console.error(error);
-    setStatus("取得失敗："+error.message+
-      "。請檢查網路、資料來源或瀏覽器連線限制。",0);
-    alert("行情取得失敗\n\n"+error.message+
-      "\n\n若使用 Koder，請確認網路連線及公開 API 是否可正常存取。");
+
+    setStatus(
+      "取得失敗："+error.message+
+      "。請檢查 Worker 網址、網路或 API 連線。",0
+    );
+
+    alert(
+      "行情取得失敗\n\n"+
+      error.message+
+      "\n\n請確認 Cloudflare Worker 已部署成功，並檢查網路連線。"
+    );
+
   }finally{
+
     isScanning=false;
+
     btn.disabled=false;
     btn.textContent="⟳ 開始全市場掃描";
   }
 }
 
+/* =========================================
+   個股歷史數據計算
+========================================= */
+
 function calculateStock(code,item){
-  if(!item || !item.history || !item.history.length) return null;
+
+  if(!item || !Array.isArray(item.history) || !item.history.length){
+    return null;
+  }
 
   const h=item.history;
+
   const latest=h[h.length-1];
   const count=h.length;
 
@@ -439,80 +622,148 @@ function calculateStock(code,item){
     close:latest.close,
     volume:latest.volume,
     days:count,
+
     low22:null,
     low66:null,
+
     dist22:null,
     dist66:null,
+
     avg5:null,
     avg10:null,
     avg20:null,
+
     ratio5:null,
     ratio10:null,
     ratio20:null,
+
     signal:false,
     status:"資料累積中",
     score:0
   };
 
-  function averageVolume(n){
-    if(count<n) return null;
-    const values=h.slice(-n).map(x=>x.volume);
-    return values.reduce((a,b)=>a+b,0)/n;
-  }
+  /*
+    低點計算：
+    使用最近 N 個交易日的最低價，
+    包含當日。
+  */
 
   function lowest(n){
+
     if(count<n) return null;
-    return Math.min(...h.slice(-n).map(x=>x.low));
+
+    const values=h.slice(-n).map(x=>x.low);
+
+    return Math.min(...values);
+  }
+
+  /*
+    均量計算：
+    使用當日之前的 N 個交易日，
+    不包含當日成交量。
+
+    因此：
+    20日均量需要21個交易日資料。
+  */
+
+  function averagePreviousVolume(n){
+
+    if(count<n+1) return null;
+
+    const values=h.slice(-(n+1),-1).map(x=>x.volume);
+
+    return values.reduce((a,b)=>a+b,0)/n;
   }
 
   result.low22=lowest(22);
   result.low66=lowest(66);
-  result.avg5=averageVolume(5);
-  result.avg10=averageVolume(10);
-  result.avg20=averageVolume(20);
 
-  if(result.low22!==null){
-    result.dist22=(result.close/result.low22-1)*100;
+  result.avg5=averagePreviousVolume(5);
+  result.avg10=averagePreviousVolume(10);
+  result.avg20=averagePreviousVolume(20);
+
+  if(result.low22!==null && result.low22>0){
+    result.dist22=
+      (result.close/result.low22-1)*100;
   }
 
-  if(result.low66!==null){
-    result.dist66=(result.close/result.low66-1)*100;
+  if(result.low66!==null && result.low66>0){
+    result.dist66=
+      (result.close/result.low66-1)*100;
   }
 
-  if(result.avg5>0) result.ratio5=result.volume/result.avg5;
-  if(result.avg10>0) result.ratio10=result.volume/result.avg10;
-  if(result.avg20>0) result.ratio20=result.volume/result.avg20;
+  if(result.avg5>0){
+    result.ratio5=result.volume/result.avg5;
+  }
+
+  if(result.avg10>0){
+    result.ratio10=result.volume/result.avg10;
+  }
+
+  if(result.avg20>0){
+    result.ratio20=result.volume/result.avg20;
+  }
 
   return result;
 }
 
+/* =========================================
+   篩選條件
+========================================= */
+
 function runFilter(){
-  latestRows=Object.keys(database.stocks).map(code=>
-    calculateStock(code,database.stocks[code])
-  ).filter(Boolean);
 
-  const near=numberValue(document.getElementById("nearPct").value);
-  const multiple=numberValue(document.getElementById("volumeRatio").value);
+  // 有最新行情時，以最新行情股票清單為準
+  // 重新開啟程式時，則使用本機已儲存股票
+  const sourceRows=latestRows.length?
+    latestRows:
+    Object.keys(database.stocks).map(code=>
+      calculateStock(code,database.stocks[code])
+    ).filter(Boolean);
+
+  const near=numberValue(
+    document.getElementById("nearPct").value
+  );
+
+  const multiple=numberValue(
+    document.getElementById("volumeRatio").value
+  );
+
   const period=document.getElementById("lowPeriod").value;
-  const avgPeriod=Number(document.getElementById("avgPeriod").value);
 
-  const safeNear=Number.isFinite(near)?Math.max(0,near):3;
-  const safeMultiple=Number.isFinite(multiple)?Math.max(1,multiple):1.5;
+  const avgPeriod=Number(
+    document.getElementById("avgPeriod").value
+  );
 
-  filteredRows=latestRows.map(stock=>{
+  const safeNear=Number.isFinite(near)?
+    Math.max(0,near):3;
+
+  const safeMultiple=Number.isFinite(multiple)?
+    Math.max(1,multiple):1.5;
+
+  filteredRows=sourceRows.map(stock=>{
+
     let distances=[];
 
-    if((period==="22" || period==="both") && stock.dist22!==null){
+    if(
+      (period==="22" || period==="both") &&
+      stock.dist22!==null
+    ){
       distances.push(stock.dist22);
     }
 
-    if((period==="66" || period==="both") && stock.dist66!==null){
+    if(
+      (period==="66" || period==="both") &&
+      stock.dist66!==null
+    ){
       distances.push(stock.dist66);
     }
 
-    const distance=distances.length?Math.min(...distances):null;
+    const distance=distances.length?
+      Math.min(...distances):null;
 
     let ratio=null;
+
     if(avgPeriod===5) ratio=stock.ratio5;
     if(avgPeriod===10) ratio=stock.ratio10;
     if(avgPeriod===20) ratio=stock.ratio20;
@@ -522,6 +773,7 @@ function runFilter(){
 
     stock.selectedDistance=distance;
     stock.selectedRatio=ratio;
+
     stock.signal=
       enoughLow &&
       enoughVolume &&
@@ -529,32 +781,46 @@ function runFilter(){
       distance<=safeNear &&
       ratio>=safeMultiple;
 
-    stock.status=stock.signal?"爆量止跌":
-      (!enoughLow || !enoughVolume)?"資料累積中":"未符合";
+    stock.status=stock.signal?
+      "爆量止跌":
+      (!enoughLow || !enoughVolume)?
+      "資料累積中":
+      "未符合";
 
     stock.score=stock.signal?
       (ratio*10+(safeNear-distance)*2):0;
 
     return stock;
+
   });
 
   filteredRows.sort((a,b)=>
-    b.score-a.score || (b.selectedRatio||0)-(a.selectedRatio||0)
+    b.score-a.score ||
+    (b.selectedRatio||0)-(a.selectedRatio||0)
   );
 
   document.getElementById("signalCount").textContent=
     filteredRows.filter(x=>x.signal).length;
 
   updateStats();
+
   renderTable();
 }
 
+/* =========================================
+   統計數字
+========================================= */
+
 function updateStats(total){
+
   const days=database.days.length;
+
   document.getElementById("totalStocks").textContent=
-    total!==undefined?total:latestRows.length;
+    total!==undefined?total:latestRows.length||
+    Object.keys(database.stocks).length;
 
   document.getElementById("historyDays").textContent=days;
+
   document.getElementById("savedDays").textContent=days;
 
   document.getElementById("savedStocks").textContent=
@@ -564,38 +830,57 @@ function updateStats(total){
     Math.min(100,days/66*100)+"%";
 }
 
+/* =========================================
+   分頁切換
+========================================= */
+
 function changeTab(tab){
+
   currentTab=tab;
 
   ["signal","all","pending"].forEach(name=>{
+
     const el=document.getElementById(
       name==="signal"?"tabSignal":
       name==="all"?"tabAll":"tabPending"
     );
+
     el.classList.toggle("active",name===tab);
+
   });
 
   renderTable();
 }
 
+/* =========================================
+   股票表格
+========================================= */
+
 function renderTable(){
-  const search=document.getElementById("searchInput").value.trim().toLowerCase();
+
+  const search=document.getElementById("searchInput")
+    .value.trim().toLowerCase();
+
   const tbody=document.getElementById("stockTable");
+
   tbody.innerHTML="";
 
   let rows=filteredRows;
 
   if(currentTab==="signal"){
     rows=rows.filter(x=>x.signal);
+
   }else if(currentTab==="pending"){
     rows=rows.filter(x=>x.status==="資料累積中");
   }
 
   if(search){
+
     rows=rows.filter(x=>
       x.code.toLowerCase().includes(search) ||
       x.name.toLowerCase().includes(search)
     );
+
   }
 
   document.getElementById("resultCount").textContent=
@@ -606,18 +891,21 @@ function renderTable(){
   );
 
   if(rows.length===0){
+
     document.getElementById("emptyMessage").textContent=
       currentTab==="signal"?
-      "目前沒有符合爆量止跌條件的股票。"+
-      "\n請確認已累積足夠交易日資料，或調整篩選參數。":
+      "目前沒有符合爆量止跌條件的股票。\n請確認已累積足夠交易日資料，或調整篩選參數。":
       "目前沒有可顯示的資料。";
+
     return;
   }
 
   rows.forEach(stock=>{
+
     const tr=document.createElement("tr");
 
     const nameCell=document.createElement("td");
+
     const name=document.createElement("div");
     name.className="stock-name";
     name.textContent=stock.name;
@@ -628,88 +916,156 @@ function renderTable(){
 
     nameCell.append(name,code);
 
-    const close=makeCell(formatNumber(stock.close,2));
-    const volume=makeCell(formatNumber(stock.volume/1000,0));
+    const close=makeCell(
+      formatNumber(stock.close,2)
+    );
+
+    const volume=makeCell(
+      formatNumber(stock.volume/1000,0)
+    );
 
     const distance=makeCell(
       stock.selectedDistance===null?
-      "--":formatNumber(stock.selectedDistance,2)+"%"
+      "--":
+      formatNumber(stock.selectedDistance,2)+"%"
     );
 
     const ratio=makeCell(
       stock.selectedRatio===null?
-      "--":formatNumber(stock.selectedRatio,2)+" 倍"
+      "--":
+      formatNumber(stock.selectedRatio,2)+" 倍"
     );
 
     if(stock.selectedDistance!==null){
-      distance.className=stock.selectedDistance<=3?
+
+      distance.className=
+        stock.selectedDistance<=3?
         "positive":"warning";
     }
 
     if(stock.selectedRatio!==null){
-      ratio.className=stock.selectedRatio>=1.5?
+
+      const limit=numberValue(
+        document.getElementById("volumeRatio").value
+      );
+
+      ratio.className=
+        stock.selectedRatio>=limit?
         "positive":"warning";
     }
 
     const status=document.createElement("td");
+
     const tag=document.createElement("span");
 
     tag.className="tag "+
-      (stock.signal?"tag-green":
-      stock.status==="資料累積中"?"tag-yellow":"tag-blue");
+      (stock.signal?
+      "tag-green":
+      stock.status==="資料累積中"?
+      "tag-yellow":"tag-blue");
 
     tag.textContent=stock.status;
+
     status.appendChild(tag);
 
-    tr.append(nameCell,close,volume,distance,ratio,status);
+    tr.append(
+      nameCell,
+      close,
+      volume,
+      distance,
+      ratio,
+      status
+    );
+
     tbody.appendChild(tr);
+
   });
 }
 
 function makeCell(value){
+
   const td=document.createElement("td");
+
   td.textContent=value;
+
   return td;
 }
 
 function formatNumber(value,digits){
-  if(value===null || value===undefined || !Number.isFinite(value)){
+
+  if(
+    value===null ||
+    value===undefined ||
+    !Number.isFinite(value)
+  ){
     return "--";
   }
+
   return value.toLocaleString("zh-TW",{
     minimumFractionDigits:digits,
     maximumFractionDigits:digits
   });
 }
 
+/* =========================================
+   匯出備份
+========================================= */
+
 function exportData(){
+
   const content=JSON.stringify(database,null,2);
-  const blob=new Blob([content],{type:"application/json"});
+
+  const blob=new Blob([content],{
+    type:"application/json"
+  });
+
   const url=URL.createObjectURL(blob);
+
   const a=document.createElement("a");
+
   a.href=url;
   a.download="NEXUS_股票歷史資料備份.json";
+
   document.body.appendChild(a);
+
   a.click();
+
   a.remove();
-  URL.revokeObjectURL(url);
+
+  setTimeout(()=>{
+    URL.revokeObjectURL(url);
+  },1000);
 }
 
+/* =========================================
+   匯入備份
+========================================= */
+
 function importData(event){
+
   const file=event.target.files[0];
+
   if(!file) return;
 
   const reader=new FileReader();
 
   reader.onload=()=>{
+
     try{
+
       const imported=JSON.parse(reader.result);
 
-      if(!imported.days || !imported.stocks){
+      if(
+        !Array.isArray(imported.days) ||
+        !imported.stocks ||
+        typeof imported.stocks!=="object"
+      ){
         throw new Error("資料格式不正確");
       }
 
-      if(!confirm("匯入資料將與目前本機資料合併，是否繼續？")){
+      if(!confirm(
+        "匯入資料將與目前本機資料合併，是否繼續？"
+      )){
         event.target.value="";
         return;
       }
@@ -720,84 +1076,138 @@ function importData(event){
       ]);
 
       Object.keys(imported.stocks).forEach(code=>{
+
         const incoming=imported.stocks[code];
 
+        if(!incoming || !Array.isArray(incoming.history)){
+          return;
+        }
+
         if(!database.stocks[code]){
+
           database.stocks[code]={
-            name:incoming.name,
+            name:incoming.name||code,
             history:[]
           };
         }
 
         const existing=database.stocks[code];
+
         const map=new Map();
 
-        [...(existing.history||[]),...(incoming.history||[])]
-          .forEach(row=>map.set(row.date,row));
+        [
+          ...(existing.history||[]),
+          ...(incoming.history||[])
+        ].forEach(row=>{
+
+          if(row && row.date){
+            map.set(row.date,row);
+          }
+
+        });
 
         existing.history=[...map.values()]
           .sort((a,b)=>a.date.localeCompare(b.date))
           .slice(-120);
 
         existing.name=incoming.name||existing.name;
+
       });
 
-      database.days=[...mergedDays].sort().slice(-120);
+      database.days=[...mergedDays]
+        .sort()
+        .slice(-120);
 
       if(saveDatabase()){
+
+        latestRows=[];
+
         alert("匯入成功！");
+
         runFilter();
+
         updateStats();
       }
 
     }catch(error){
+
       alert("匯入失敗："+error.message);
+
     }
 
     event.target.value="";
+
   };
 
   reader.readAsText(file);
 }
 
+/* =========================================
+   清除歷史資料
+========================================= */
+
 function clearHistory(){
-  if(!confirm("確定要刪除本機所有歷史行情資料？\n刪除後無法復原，請先備份。")){
+
+  if(!confirm(
+    "確定要刪除本機所有歷史行情資料？\n刪除後無法復原，請先備份。"
+  )){
     return;
   }
 
-  if(!confirm("再次確認：真的要清除全部歷史資料嗎？")){
+  if(!confirm(
+    "再次確認：真的要清除全部歷史資料嗎？"
+  )){
     return;
   }
 
-  database={days:[],stocks:{}};
+  database={
+    days:[],
+    stocks:{}
+  };
+
   saveDatabase();
+
   latestRows=[];
   filteredRows=[];
 
   document.getElementById("dataDate").textContent="--";
+
   document.getElementById("signalCount").textContent="0";
+
   setStatus("歷史資料已清除，請重新掃描。",0);
 
   updateStats(0);
+
   renderTable();
 }
 
+/* =========================================
+   初始化
+========================================= */
+
 function initialize(){
+
   updateStats();
+
   runFilter();
 
   if(database.days.length){
+
     document.getElementById("dataDate").textContent=
       database.days[database.days.length-1];
 
     setStatus(
-      "已載入本機歷史資料，共 "+database.days.length+
-      " 個交易日。按下掃描可取得最新行情。",0
+      "已載入本機歷史資料，共 "+
+      database.days.length+
+      " 個交易日。按下掃描可取得最新行情。",
+      0
     );
+
   }
 }
 
 initialize();
+
 </script>
 </body>
 </html>
